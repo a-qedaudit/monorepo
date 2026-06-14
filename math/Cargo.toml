@@ -58,3 +58,8 @@ bench = false
 name = "interpolation"
 harness = false
 path = "benches/interpolation.rs"
+
+[[bench]]
+name = "ntt"
+harness = false
+path = "benches/ntt.rs"
