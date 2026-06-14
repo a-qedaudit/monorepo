@@ -341,7 +341,7 @@ mod dense_tests {
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn simd_available() -> bool {
+    const fn simd_available() -> bool {
         true
     }
 
