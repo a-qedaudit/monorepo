@@ -537,7 +537,7 @@ impl<H: Hasher> PhasedScheme for Zoda<H> {
         let encoded_data = data
             .as_polynomials(topology.encoded_rows)
             .expect("data has too many rows")
-            .evaluate()
+            .evaluate_with(strategy)
             .data();
 
         // Step 3: Commit to the rows of the data using a Binary Merkle Tree.
@@ -561,7 +561,7 @@ impl<H: Hasher> PhasedScheme for Zoda<H> {
         // Step 5: Generate a checking matrix and checksum with the commitment.
         let mut transcript = Transcript::resume(commitment);
         let checking_matrix = checking_matrix(&transcript, &topology);
-        let checksum = Arc::new(data.mul(&checking_matrix));
+        let checksum = Arc::new(data.mul_with(&checking_matrix, strategy));
         // Bind index sampling to this checksum to prevent follower-specific malleability.
         // It's important to commit to the checksum itself, rather than its encoding,
         // because followers have to encode the checksum itself to prevent the leader from
@@ -636,7 +636,7 @@ impl<H: Hasher> PhasedScheme for Zoda<H> {
         commitment: &Self::Commitment,
         checking_data: Self::CheckingData,
         shards: impl Iterator<Item = &'a Self::CheckedShard>,
-        _strategy: &impl Strategy,
+        strategy: &impl Strategy,
     ) -> Result<Vec<u8>, Self::Error> {
         if checking_data.commitment != *commitment {
             return Err(Error::InvalidShard);
@@ -677,7 +677,7 @@ impl<H: Hasher> PhasedScheme for Zoda<H> {
             data_bytes,
             F::stream_to_u64s(
                 evaluation
-                    .recover()
+                    .recover_with(strategy)
                     .coefficients_up_to(data_rows)
                     .flatten()
                     .copied(),
