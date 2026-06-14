@@ -192,9 +192,7 @@ mod avx2 {
         cols: usize,
         data: &mut [F],
     ) {
-        let lg_rows = rows.ilog2() as usize;
-        assert_eq!(1 << lg_rows, rows, "rows should be a power of 2");
-        debug_assert_eq!(data.len(), rows * cols);
+        let lg_rows = crate::ntt::dense_ntt_lg_rows(rows, cols, data.len());
         let raw = as_u64_mut(data);
         let ptr = raw.as_mut_ptr();
         let main = cols - cols % WIDTH;
@@ -333,9 +331,19 @@ mod avx2 {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod dense_tests {
     use super::{ntt_dense, F, P};
+
+    #[cfg(target_arch = "x86_64")]
+    fn simd_available() -> bool {
+        std::is_x86_feature_detected!("avx2")
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn simd_available() -> bool {
+        true
+    }
 
     fn rand_data(n: usize, seed: u64) -> Vec<F> {
         let mut x = seed | 1;
@@ -349,11 +357,11 @@ mod dense_tests {
             .collect()
     }
 
-    /// The dispatched (AVX2 here) dense NTT must equal the scalar reference, across
-    /// directions, sizes, and `cols % WIDTH` remainders.
+    /// The dispatched SIMD dense NTT must equal the scalar reference, across directions,
+    /// sizes, and SIMD-width remainders.
     #[test]
     fn dense_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !simd_available() {
             return;
         }
         for lg in [0usize, 1, 2, 4, 8, 12] {
@@ -374,6 +382,20 @@ mod dense_tests {
                 assert_eq!(got, want, "inverse lg={lg} cols={cols}");
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "data length must equal rows * cols")]
+    fn dense_rejects_short_data() {
+        let mut data = vec![F(0); 3];
+        ntt_dense::<true>(2, 2, &mut data);
+    }
+
+    #[test]
+    #[should_panic(expected = "rows should be a non-zero power of 2")]
+    fn dense_rejects_zero_rows() {
+        let mut data = Vec::new();
+        ntt_dense::<true>(0, 0, &mut data);
     }
 }
 
@@ -477,9 +499,7 @@ mod neon {
         cols: usize,
         data: &mut [F],
     ) {
-        let lg_rows = rows.ilog2() as usize;
-        assert_eq!(1 << lg_rows, rows, "rows should be a power of 2");
-        debug_assert_eq!(data.len(), rows * cols);
+        let lg_rows = crate::ntt::dense_ntt_lg_rows(rows, cols, data.len());
         let raw = as_u64_mut(data);
         let ptr = raw.as_mut_ptr();
         let main = cols - cols % WIDTH;

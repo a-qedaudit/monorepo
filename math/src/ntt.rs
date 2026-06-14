@@ -162,6 +162,17 @@ fn ntt<const FORWARD: bool, F: FieldNTT, M: IndexMut<(usize, usize), Output = F>
     }
 }
 
+/// Validate a dense NTT's shape and return `log2(rows)`.
+pub(crate) fn dense_ntt_lg_rows(rows: usize, cols: usize, data_len: usize) -> usize {
+    assert!(rows.is_power_of_two(), "rows should be a non-zero power of 2");
+    let expected_len = rows.checked_mul(cols).expect("rows * cols overflows usize");
+    assert_eq!(
+        data_len, expected_len,
+        "data length must equal rows * cols"
+    );
+    rows.ilog2() as usize
+}
+
 /// In-place NTT (inverse when `FORWARD` is false) over a dense, row-major
 /// `rows x cols` slice, treating each column as an independent lane.
 ///
@@ -175,9 +186,7 @@ pub(crate) fn ntt_dense_scalar<const FORWARD: bool, F: FieldNTT>(
     cols: usize,
     data: &mut [F],
 ) {
-    let lg_rows = rows.ilog2() as usize;
-    assert_eq!(1 << lg_rows, rows, "rows should be a power of 2");
-    debug_assert_eq!(data.len(), rows * cols, "data length must equal rows * cols");
+    let lg_rows = dense_ntt_lg_rows(rows, cols, data.len());
     let w = {
         let w = F::root_of_unity(lg_rows as u8).expect("too many rows to perform NTT");
         if FORWARD {
@@ -907,20 +916,35 @@ impl<F: Additive> Matrix<F> {
         }
         assert_eq!(self.cols, other.rows);
         let out_cols = other.cols;
-        let rows: Vec<Vec<F>> = strategy.map_collect_vec(0..self.rows, |i| {
-            let mut row = vec![F::zero(); out_cols];
-            for j in 0..self.cols {
-                let c = self[(i, j)].clone();
-                let other_j = &other[j];
-                for (k, out_k) in row.iter_mut().enumerate() {
-                    *out_k += &(c.clone() * &other_j[k]);
+        if self.rows == 0 || out_cols == 0 {
+            return Self {
+                rows: self.rows,
+                cols: out_cols,
+                data: Vec::new(),
+            };
+        }
+        let num_blocks = strategy.parallelism_hint().clamp(1, self.rows);
+        let block_rows = self.rows.div_ceil(num_blocks);
+        let num_blocks = self.rows.div_ceil(block_rows);
+        let blocks: Vec<Vec<F>> = strategy.map_collect_vec(0..num_blocks, |b| {
+            let row_start = b * block_rows;
+            let row_end = (row_start + block_rows).min(self.rows);
+            let mut block = vec![F::zero(); (row_end - row_start) * out_cols];
+            for (local_i, i) in (row_start..row_end).enumerate() {
+                let row = &mut block[local_i * out_cols..(local_i + 1) * out_cols];
+                for j in 0..self.cols {
+                    let c = self[(i, j)].clone();
+                    let other_j = &other[j];
+                    for (k, out_k) in row.iter_mut().enumerate() {
+                        *out_k += &(c.clone() * &other_j[k]);
+                    }
                 }
             }
-            row
+            block
         });
         let mut data = Vec::with_capacity(self.rows * out_cols);
-        for row in rows {
-            data.extend(row);
+        for block in blocks {
+            data.extend(block);
         }
         Self {
             rows: self.rows,
@@ -1675,6 +1699,18 @@ mod test {
                 "matrix element count does not match dimensions"
             ))
         ));
+    }
+
+    #[test]
+    fn matrix_mul_with_matches_mul() {
+        use commonware_parallel::Rayon;
+        use core::num::NonZeroUsize;
+
+        let left = Matrix::init(5, 3, (0..15).map(|i| F::from(i + 1)));
+        let right = Matrix::init(3, 4, (0..12).map(|i| F::from((i * 7 + 3) as u64)));
+        let strategy = Rayon::new(NonZeroUsize::new(3).unwrap()).unwrap();
+
+        assert_eq!(left.mul_with(&right, &strategy), left.mul(&right));
     }
 
     fn assert_vanishing_points_correct(points: &VanishingPoints) {
