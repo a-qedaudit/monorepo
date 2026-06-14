@@ -161,6 +161,76 @@ fn ntt<const FORWARD: bool, F: FieldNTT, M: IndexMut<(usize, usize), Output = F>
     }
 }
 
+/// In-place NTT (inverse when `FORWARD` is false) over a dense, row-major
+/// `rows x cols` slice, treating each column as an independent lane.
+///
+/// This is the default kernel behind [`crate::algebra::FieldNTT::ntt_dense`] and is
+/// equivalent to running [`ntt`] over a row-major [`Matrix`]. It operates on whole
+/// row slices (rather than an indexable view) so that a field can override
+/// `ntt_dense` with a vectorized kernel over the contiguous columns. Single-column
+/// and partial-segment NTTs continue to use [`ntt`].
+pub(crate) fn ntt_dense_scalar<const FORWARD: bool, F: FieldNTT>(
+    rows: usize,
+    cols: usize,
+    data: &mut [F],
+) {
+    let lg_rows = rows.ilog2() as usize;
+    assert_eq!(1 << lg_rows, rows, "rows should be a power of 2");
+    debug_assert_eq!(data.len(), rows * cols, "data length must equal rows * cols");
+    let w = {
+        let w = F::root_of_unity(lg_rows as u8).expect("too many rows to perform NTT");
+        if FORWARD {
+            w
+        } else {
+            w.exp(&[(1 << lg_rows) - 1])
+        }
+    };
+    let stages = {
+        let mut out = vec![(0usize, F::zero()); lg_rows];
+        let mut w_i = w;
+        for i in (0..lg_rows).rev() {
+            out[i] = (i, w_i.clone());
+            w_i = w_i.clone() * &w_i;
+        }
+        if !FORWARD {
+            out.reverse();
+        }
+        out
+    };
+    for (stage, w) in stages.into_iter() {
+        let skip = 1 << stage;
+        let mut i = 0;
+        while i < rows {
+            let mut w_j = F::one();
+            for j in 0..skip {
+                let index_a = i + j;
+                let index_b = index_a + skip;
+                // `index_a < index_b`, so the two row slices are disjoint.
+                let (left, right) = data.split_at_mut(index_b * cols);
+                let a = &mut left[index_a * cols..index_a * cols + cols];
+                let b = &mut right[..cols];
+                if FORWARD {
+                    for k in 0..cols {
+                        let w_j_b = w_j.clone() * &b[k];
+                        let a_k = a[k].clone();
+                        a[k] = a_k.clone() + &w_j_b;
+                        b[k] = a_k - &w_j_b;
+                    }
+                } else {
+                    for k in 0..cols {
+                        let a_k = a[k].clone();
+                        let b_k = b[k].clone();
+                        a[k] = (a_k.clone() + &b_k).div_2();
+                        b[k] = ((a_k - &b_k) * &w_j).div_2();
+                    }
+                }
+                w_j *= &w;
+            }
+            i += 2 * skip;
+        }
+    }
+}
+
 /// Columns of some larger piece of data.
 ///
 /// This allows us to easily do NTTs over partial segments of some bigger matrix.
@@ -829,7 +899,7 @@ impl<F: Additive> Matrix<F> {
 
 impl<F: FieldNTT> Matrix<F> {
     fn ntt<const FORWARD: bool>(&mut self) {
-        ntt::<FORWARD, F, Self>(self.rows, self.cols, self)
+        F::ntt_dense::<FORWARD>(self.rows, self.cols, &mut self.data)
     }
 }
 
@@ -1054,7 +1124,7 @@ impl<F: FieldNTT> PolynomialVector<F> {
         let skew_inv = F::coset_shift_inv();
         self.divide_roots(skew.clone());
         q.divide_roots(skew);
-        ntt::<true, F, _>(self.data.rows, self.data.cols, &mut self.data);
+        F::ntt_dense::<true>(self.data.rows, self.data.cols, &mut self.data.data);
         ntt::<true, F, _>(
             q.coefficients.len(),
             1,
@@ -1075,7 +1145,7 @@ impl<F: FieldNTT> PolynomialVector<F> {
             }
         }
         // Interpolate back, using the inverse skew
-        ntt::<false, F, _>(self.data.rows, self.data.cols, &mut self.data);
+        F::ntt_dense::<false>(self.data.rows, self.data.cols, &mut self.data.data);
         self.divide_roots(skew_inv);
     }
 }
