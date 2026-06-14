@@ -27,9 +27,10 @@ const EPSILON: u64 = 0xFFFF_FFFF;
 /// Sound because [`F`] is `#[repr(transparent)]` over `u64`.
 #[allow(dead_code)]
 #[inline]
-fn as_u64_mut(data: &mut [F]) -> &mut [u64] {
+const fn as_u64_mut(data: &mut [F]) -> &mut [u64] {
+    let len = data.len();
     // SAFETY: `F` is `#[repr(transparent)]` over `u64`, so the layouts match.
-    unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u64>(), data.len()) }
+    unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u64>(), len) }
 }
 
 /// Dense NTT (inverse when `FORWARD` is false) over a row-major `rows x cols` slice.
@@ -70,7 +71,7 @@ fn twiddle_stages<const FORWARD: bool>(lg_rows: usize) -> Vec<(usize, F)> {
     let mut w_i = w;
     for i in (0..lg_rows).rev() {
         out[i] = (i, w_i);
-        w_i = w_i * &w_i;
+        w_i = w_i * w_i;
     }
     if !FORWARD {
         out.reverse();
@@ -230,12 +231,12 @@ mod avx2 {
                         let a = F(*ptr.add(base_a + k));
                         let b = F(*ptr.add(base_b + k));
                         if FORWARD {
-                            let t = w_j * &b;
-                            *ptr.add(base_a + k) = (a + &t).0;
-                            *ptr.add(base_b + k) = (a - &t).0;
+                            let t = w_j * b;
+                            *ptr.add(base_a + k) = (a + t).0;
+                            *ptr.add(base_b + k) = (a - t).0;
                         } else {
-                            *ptr.add(base_a + k) = (a + &b).div_2().0;
-                            *ptr.add(base_b + k) = ((a - &b) * &w_j).div_2().0;
+                            *ptr.add(base_a + k) = (a + b).div_2().0;
+                            *ptr.add(base_b + k) = ((a - b) * w_j).div_2().0;
                         }
                     }
                     w_j *= &w_stage;
@@ -252,7 +253,8 @@ mod avx2 {
         use crate::algebra::FieldNTT;
         use core::arch::x86_64::*;
 
-        fn lanes_of(op: impl Fn(__m256i, __m256i) -> __m256i, a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+        fn lanes_of(op: unsafe fn(__m256i, __m256i) -> __m256i, a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+            // SAFETY: callers gate on `is_x86_feature_detected!("avx2")`.
             unsafe {
                 let va = _mm256_loadu_si256(a.as_ptr().cast());
                 let vb = _mm256_loadu_si256(b.as_ptr().cast());
@@ -261,6 +263,10 @@ mod avx2 {
                 _mm256_storeu_si256(out.as_mut_ptr().cast(), r);
                 out
             }
+        }
+
+        unsafe fn div2_bin(x: __m256i, _y: __m256i) -> __m256i {
+            div2(x)
         }
 
         fn samples() -> Vec<u64> {
@@ -300,15 +306,12 @@ mod avx2 {
                 for &b in &s {
                     let aa = [a, b, (a + 1) % P, (b + 2) % P];
                     let bb = [b, a, (b + 3) % P, (a + 5) % P];
-                    let exp_add: [u64; 4] =
-                        core::array::from_fn(|i| (F(aa[i]) + &F(bb[i])).0);
-                    let exp_sub: [u64; 4] =
-                        core::array::from_fn(|i| (F(aa[i]) - &F(bb[i])).0);
-                    let exp_mul: [u64; 4] =
-                        core::array::from_fn(|i| (F(aa[i]) * &F(bb[i])).0);
-                    assert_eq!(lanes_of(|x, y| unsafe { add(x, y) }, aa, bb), exp_add);
-                    assert_eq!(lanes_of(|x, y| unsafe { sub(x, y) }, aa, bb), exp_sub);
-                    assert_eq!(lanes_of(|x, y| unsafe { mul(x, y) }, aa, bb), exp_mul);
+                    let exp_add: [u64; 4] = core::array::from_fn(|i| (F(aa[i]) + F(bb[i])).0);
+                    let exp_sub: [u64; 4] = core::array::from_fn(|i| (F(aa[i]) - F(bb[i])).0);
+                    let exp_mul: [u64; 4] = core::array::from_fn(|i| (F(aa[i]) * F(bb[i])).0);
+                    assert_eq!(lanes_of(add, aa, bb), exp_add);
+                    assert_eq!(lanes_of(sub, aa, bb), exp_sub);
+                    assert_eq!(lanes_of(mul, aa, bb), exp_mul);
                 }
             }
         }
@@ -323,7 +326,7 @@ mod avx2 {
                 let mut aa = [0u64; 4];
                 aa[..chunk.len()].copy_from_slice(chunk);
                 let exp: [u64; 4] = core::array::from_fn(|i| F(aa[i]).div_2().0);
-                let got = lanes_of(|x, _| unsafe { div2(x) }, aa, aa);
+                let got = lanes_of(div2_bin, aa, aa);
                 assert_eq!(got, exp);
             }
         }
@@ -369,6 +372,227 @@ mod dense_tests {
                 ntt_dense::<false>(rows, cols, &mut got);
                 crate::ntt::ntt_dense_scalar::<false, F>(rows, cols, &mut want);
                 assert_eq!(got, want, "inverse lg={lg} cols={cols}");
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::{as_u64_mut, twiddle_stages, F, P};
+    use crate::algebra::{FieldNTT, Ring};
+    use core::arch::aarch64::*;
+
+    /// Number of `u64` lanes per NEON register.
+    const WIDTH: usize = 2;
+
+    #[inline(always)]
+    unsafe fn load(p: *const u64) -> uint64x2_t {
+        vld1q_u64(p)
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut u64, v: uint64x2_t) {
+        vst1q_u64(p, v);
+    }
+    #[inline(always)]
+    unsafe fn splat(x: u64) -> uint64x2_t {
+        vdupq_n_u64(x)
+    }
+    /// Per-lane `mask ? t : f` (mask must be all-ones / all-zeros).
+    #[inline(always)]
+    unsafe fn select(mask: uint64x2_t, t: uint64x2_t, f: uint64x2_t) -> uint64x2_t {
+        vbslq_u64(mask, t, f)
+    }
+
+    /// Field add; mirrors `F::add_inner`.
+    #[inline(always)]
+    unsafe fn add(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        let p = splat(P);
+        let sum = vaddq_u64(x, y);
+        let overflow = vcltq_u64(sum, x);
+        let ge_p = vcgeq_u64(sum, p);
+        let cond = vorrq_u64(overflow, ge_p);
+        select(cond, vsubq_u64(sum, p), sum)
+    }
+    /// Field sub; mirrors `F::sub_inner`.
+    #[inline(always)]
+    unsafe fn sub(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        let p = splat(P);
+        let diff = vsubq_u64(x, y);
+        let borrow = vcltq_u64(x, y);
+        select(borrow, vaddq_u64(diff, p), diff)
+    }
+    /// Widening `64 x 64 -> 128` per lane, returning `(lo, hi)`.
+    #[inline(always)]
+    unsafe fn mul_wide(a: uint64x2_t, b: uint64x2_t) -> (uint64x2_t, uint64x2_t) {
+        let mask32 = vdupq_n_u64(0xFFFF_FFFF);
+        let a_lo = vmovn_u64(a);
+        let a_hi = vshrn_n_u64(a, 32);
+        let b_lo = vmovn_u64(b);
+        let b_hi = vshrn_n_u64(b, 32);
+        // 32x32 -> 64 partial products.
+        let ll = vmull_u32(a_lo, b_lo);
+        let lh = vmull_u32(a_lo, b_hi);
+        let hl = vmull_u32(a_hi, b_lo);
+        let hh = vmull_u32(a_hi, b_hi);
+        // Combine columns; each 64-bit add below is overflow-free for 32-bit inputs.
+        let ll_hi = vshrq_n_u64(ll, 32);
+        let t = vaddq_u64(lh, ll_hi);
+        let t_lo = vandq_u64(t, mask32);
+        let t_hi = vshrq_n_u64(t, 32);
+        let u = vaddq_u64(hl, t_lo);
+        let lo = vorrq_u64(
+            vandq_u64(ll, mask32),
+            vshlq_n_u64(vandq_u64(u, mask32), 32),
+        );
+        let hi = vaddq_u64(vaddq_u64(hh, t_hi), vshrq_n_u64(u, 32));
+        (lo, hi)
+    }
+    /// Field mul; mirrors `F::reduce_128(a*b)`.
+    #[inline(always)]
+    unsafe fn mul(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        let (lo, hi) = mul_wide(a, b);
+        let mask32 = vdupq_n_u64(0xFFFF_FFFF);
+        let mid = vandq_u64(hi, mask32);
+        let top = vshrq_n_u64(hi, 32);
+        let beps = vsubq_u64(vshlq_n_u64(mid, 32), mid);
+        add(sub(lo, top), beps)
+    }
+    /// Field halving; mirrors `F::div_2`.
+    #[inline(always)]
+    unsafe fn div2(x: uint64x2_t) -> uint64x2_t {
+        let one = vdupq_n_u64(1);
+        let odd = vceqq_u64(vandq_u64(x, one), one);
+        let even = vshrq_n_u64(x, 1);
+        let addp = vaddq_u64(x, splat(P));
+        let carry = vcltq_u64(addp, x);
+        let carry_hi = vandq_u64(carry, vdupq_n_u64(0x8000_0000_0000_0000));
+        let odd_res = vorrq_u64(carry_hi, vshrq_n_u64(addp, 1));
+        select(odd, odd_res, even)
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn ntt_dense<const FORWARD: bool>(
+        rows: usize,
+        cols: usize,
+        data: &mut [F],
+    ) {
+        let lg_rows = rows.ilog2() as usize;
+        assert_eq!(1 << lg_rows, rows, "rows should be a power of 2");
+        debug_assert_eq!(data.len(), rows * cols);
+        let raw = as_u64_mut(data);
+        let ptr = raw.as_mut_ptr();
+        let main = cols - cols % WIDTH;
+        for (stage, w_stage) in twiddle_stages::<FORWARD>(lg_rows) {
+            let skip = 1usize << stage;
+            let mut i = 0;
+            while i < rows {
+                let mut w_j = F::one();
+                for j in 0..skip {
+                    let base_a = (i + j) * cols;
+                    let base_b = (i + j + skip) * cols;
+                    let wv = splat(w_j.0);
+                    let mut k = 0;
+                    while k < main {
+                        let pa = ptr.add(base_a + k);
+                        let pb = ptr.add(base_b + k);
+                        let a = load(pa);
+                        let b = load(pb);
+                        if FORWARD {
+                            let t = mul(wv, b);
+                            store(pa, add(a, t));
+                            store(pb, sub(a, t));
+                        } else {
+                            let s = add(a, b);
+                            let d = sub(a, b);
+                            store(pa, div2(s));
+                            store(pb, div2(mul(d, wv)));
+                        }
+                        k += WIDTH;
+                    }
+                    for k in main..cols {
+                        let a = F(*ptr.add(base_a + k));
+                        let b = F(*ptr.add(base_b + k));
+                        if FORWARD {
+                            let t = w_j * b;
+                            *ptr.add(base_a + k) = (a + t).0;
+                            *ptr.add(base_b + k) = (a - t).0;
+                        } else {
+                            *ptr.add(base_a + k) = (a + b).div_2().0;
+                            *ptr.add(base_b + k) = ((a - b) * w_j).div_2().0;
+                        }
+                    }
+                    w_j *= &w_stage;
+                }
+                i += 2 * skip;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{add, div2, mul, sub, F, P};
+        use super::super::EPSILON;
+        use crate::algebra::FieldNTT;
+        use core::arch::aarch64::*;
+
+        fn lanes_of(op: unsafe fn(uint64x2_t, uint64x2_t) -> uint64x2_t, a: [u64; 2], b: [u64; 2]) -> [u64; 2] {
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe {
+                let va = vld1q_u64(a.as_ptr());
+                let vb = vld1q_u64(b.as_ptr());
+                let r = op(va, vb);
+                let mut out = [0u64; 2];
+                vst1q_u64(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        unsafe fn div2_bin(x: uint64x2_t, _y: uint64x2_t) -> uint64x2_t {
+            div2(x)
+        }
+
+        fn samples() -> Vec<u64> {
+            let mut v = vec![
+                0u64, 1, 2, P - 1, P - 2, EPSILON, EPSILON + 1, 1 << 32, (1 << 32) - 1,
+                1 << 63, u64::MAX % P, P / 2, 12345678901234567 % P,
+            ];
+            let mut x = 0x1234_5678_9abc_def0u64;
+            for _ in 0..200 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.push(x % P);
+            }
+            v
+        }
+
+        #[test]
+        fn neon_field_ops_match_scalar() {
+            let s = samples();
+            for &a in &s {
+                for &b in &s {
+                    let aa = [a, b];
+                    let bb = [b, (a + 3) % P];
+                    let exp_add: [u64; 2] = core::array::from_fn(|i| (F(aa[i]) + F(bb[i])).0);
+                    let exp_sub: [u64; 2] = core::array::from_fn(|i| (F(aa[i]) - F(bb[i])).0);
+                    let exp_mul: [u64; 2] = core::array::from_fn(|i| (F(aa[i]) * F(bb[i])).0);
+                    assert_eq!(lanes_of(add, aa, bb), exp_add);
+                    assert_eq!(lanes_of(sub, aa, bb), exp_sub);
+                    assert_eq!(lanes_of(mul, aa, bb), exp_mul);
+                }
+            }
+        }
+
+        #[test]
+        fn neon_div2_matches_scalar() {
+            let s = samples();
+            for chunk in s.chunks(2) {
+                let mut aa = [0u64; 2];
+                aa[..chunk.len()].copy_from_slice(chunk);
+                let exp: [u64; 2] = core::array::from_fn(|i| F(aa[i]).div_2().0);
+                let got = lanes_of(div2_bin, aa, aa);
+                assert_eq!(got, exp);
             }
         }
     }
