@@ -11,7 +11,12 @@
 //! scalar field (verified exhaustively against [`super::F`] in tests). Dispatch picks
 //! AVX2 (x86-64), NEON (aarch64), or the scalar fallback once per NTT.
 
-use super::{F, P};
+use super::F;
+// `P` is used only by the arch-specific SIMD submodules; gate its import to the
+// same conditions so the scalar-only build (no_std x86, or non-x86/non-aarch64)
+// does not see an unused import.
+#[cfg(any(all(target_arch = "x86_64", feature = "std"), target_arch = "aarch64"))]
+use super::P;
 use crate::algebra::FieldNTT;
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
@@ -79,7 +84,10 @@ fn twiddle_stages<const FORWARD: bool>(lg_rows: usize) -> Vec<(usize, F)> {
     out
 }
 
-#[cfg(target_arch = "x86_64")]
+// Gated on `std` to match the dispatch in `ntt_dense`: runtime AVX2 detection
+// (`is_x86_feature_detected!`) is only available with `std`, so without it this
+// module would be uncallable dead code.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 mod avx2 {
     use super::{as_u64_mut, twiddle_stages, F, P};
     use crate::algebra::{FieldNTT, Ring};

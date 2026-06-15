@@ -48,27 +48,47 @@ A packed field whose `add`/`sub`/`mul`/`div2` mirror `F::add_inner`/`sub_inner`/
 `reduce_128`/`div_2` operation-for-operation, so the vector result equals the
 scalar field bit-for-bit. The butterfly does `WIDTH` contiguous columns per
 instruction with a scalar tail for `cols % WIDTH`.
-- **AVX2** (x86-64, 4 lanes): runtime-detected, scalar fallback otherwise.
-- **NEON** (aarch64, 2 lanes): part of the baseline, no detection needed.
-- **scalar**: any other target. `F` is `#[repr(transparent)]` so `&[F]` can be
-  viewed as `&[u64]` for SIMD loads.
+- **AVX2** (x86-64 with `std`, 4 lanes): selected per call via runtime
+  `is_x86_feature_detected!`, with the scalar path taken otherwise.
+- **NEON** (aarch64, 2 lanes): part of the aarch64 baseline, so it is always used,
+  no detection needed (also works in `no_std`).
+- **scalar**: everything else, including x86-64 **without AVX2 at runtime**, x86-64
+  with the `std` feature off (no runtime detection available), and any other
+  architecture. `F` is `#[repr(transparent)]` so `&[F]` can be viewed as `&[u64]`
+  for SIMD loads.
 
 The reduction is identical across all three backends, so the exhaustively tested
 x86 path validates the NEON math; only intrinsics differ.
+
+The per-field hook validates its shape on entry (in release too):
+`dense_ntt_lg_rows` asserts `rows` is a power of two and `data.len() == rows*cols`
+(via `checked_mul`). This matters because the SIMD kernels are `unsafe` and index
+the buffer by raw pointer up to `rows*cols - 1`, so the length invariant is a
+memory-safety precondition, not just a debug aid.
+
+The checksum matrix multiply (`Matrix::mul_with`) is parallelized the same way:
+output rows are independent, so they are split into one contiguous block per
+worker (with an empty-matrix guard), each block computed into a single buffer.
 
 ## 2. Correctness
 
 - **Packed field ops == scalar `F`, exhaustively** (edges + pseudo-random, all
   lanes), for `add`/`sub`/`mul`/`div2`. AVX2 here; NEON on Apple Silicon.
-- **Dense NTT == scalar** for both directions, `rows = 2^0..2^12`, and every
-  `cols % WIDTH` remainder.
+- **Dense NTT == scalar** (the dispatched SIMD path vs `ntt_dense_scalar`) for both
+  directions, `rows = 2^0..2^12`, and every `cols % WIDTH` remainder. Runs on
+  x86-64 (AVX2) and aarch64 (NEON). Plus `should_panic` tests for the shape asserts
+  (short data, zero rows) and `mul_with == mul`.
+- **Cross-machine determinism.** Because AVX2, NEON, and scalar are all bit-identical
+  to `F`'s scalar arithmetic, a participant on a non-AVX2 / non-SIMD machine computes
+  the *same* ZODA commitment and shards as one on an AVX2 box. There is no consensus
+  hazard from mixed hardware.
 - **Combined path == sequential, byte for byte.** ZODA encoded under `Sequential`
   (SIMD, no threads) and `Rayon(t)` (threads x SIMD) produce identical commitments
   and strong shards, and round-trip correctly, across sizes `{64 KiB, 256 KiB,
   1 MiB}` x threads `{2, 8, 13}` (13 = uneven blocks).
-- `commonware-math` (26) and `commonware-coding` (34, incl. ZODA round-trips /
+- `commonware-math` (29) and `commonware-coding` (34, incl. ZODA round-trips /
   minifuzz) pass. `clippy -D warnings` + nightly `fmt` clean on x86-64 **and**
-  aarch64.
+  aarch64, in both default and `--no-default-features` (no_std) builds.
 
 ## 3. Benchmarks (128-core x86-64, AVX2, release, 8 MiB block, chunks=100)
 
